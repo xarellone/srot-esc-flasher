@@ -1,4 +1,4 @@
-name: Build BLHeli 4way for ESP32-S3-Zero
+name: Build BLHeli 4way for ESP32-S3-Zero (4MB fix)
 
 on:
   workflow_dispatch:
@@ -12,51 +12,70 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Add ESP32-S3-Zero environment and USB CDC
+      - name: Configure actual Waveshare ESP32-S3-Zero (4MB flash) and USB-Serial-JTAG
         shell: bash
         run: |
-          cat >> platformio.ini <<'EOF'
+          cat >> platformio.ini <<'INI'
 
           [env:esp32s3_zero_4way]
           extends = env:esp32_4way
           board = esp32-s3-devkitm-1
           board_upload.flash_size = 4MB
           board_build.flash_mode = dio
+          board_build.partitions = default.csv
           build_flags =
             -DARDUINO_USB_MODE=1
             -DARDUINO_USB_CDC_ON_BOOT=1
-          EOF
+
+          [env:esp32s3_zero_4way_diag]
+          extends = env:esp32s3_zero_4way
+          build_flags =
+            ${env:esp32s3_zero_4way.build_flags}
+            -DESC4WAY_DIAG_MODE=1
+          INI
           python - <<'PY'
           from pathlib import Path
           p = Path('src/esp32_4way/Global.cpp')
           s = p.read_text()
           old = 'const uint8_t ESC_PIN[NUM_ESC] = {16, 17, 18, 19};'
-          assert old in s, 'ESC pin declaration changed upstream; review patch'
+          assert old in s, 'Upstream ESC mapping changed, manual review required'
           s = s.replace(old, 'const uint8_t ESC_PIN[NUM_ESC] = {8, 9, 10, 11};')
           old = 'uint8_t g_cur_pin = 16;'
-          assert old in s, 'Initial pin changed upstream; review patch'
+          assert old in s, 'Upstream ESC default pin changed, manual review required'
           s = s.replace(old, 'uint8_t g_cur_pin = 8;')
           p.write_text(s)
           PY
 
-      - name: Compile on GitHub runner
+      - name: Build normal and USB console diagnostic firmware (GitHub only)
         run: |
-          python -m pip install --disable-pip-version-check platformio 'esptool>=5,<6'
-          pio run -e esp32s3_zero_4way
+          python -m pip install --disable-pip-version-check 'platformio>=6,<7' 'esptool>=5,<6'
+          pio run -e esp32s3_zero_4way -e esp32s3_zero_4way_diag
 
-      - name: Create merged flash image at address 0x0
+      - name: Merge full images with boot_app0 at 0xE000
+        shell: bash
         run: |
-          out='.pio/build/esp32s3_zero_4way'
-          python -m esptool --chip esp32s3 merge-bin \
-            --flash-mode dio --flash-size 4MB \
-            -o blheli4way-s3zero-merged.bin \
-            0x0 "$out/bootloader.bin" \
-            0x8000 "$out/partitions.bin" \
-            0x10000 "$out/firmware.bin"
+          set -euo pipefail
+          boot_app0="$HOME/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin"
+          test -s "$boot_app0"
+          mkdir -p dist
+          for env in esp32s3_zero_4way esp32s3_zero_4way_diag; do
+            out=".pio/build/$env"
+            test -s "$out/bootloader.bin"
+            test -s "$out/partitions.bin"
+            test -s "$out/firmware.bin"
+            python -m esptool --chip esp32s3 merge-bin \
+              --flash-mode dio --flash-size 4MB \
+              -o "dist/$env-merged.bin" \
+              0x0 "$out/bootloader.bin" \
+              0x8000 "$out/partitions.bin" \
+              0xe000 "$boot_app0" \
+              0x10000 "$out/firmware.bin"
+            ls -lh "dist/$env-merged.bin"
+          done
 
-      - name: Upload result
+      - name: Upload both .bin files
         uses: actions/upload-artifact@v4
         with:
-          name: blheli4way-esp32s3-zero
-          path: blheli4way-s3zero-merged.bin
+          name: blheli4way-esp32s3-zero-4MB-fixed
+          path: dist/*.bin
           if-no-files-found: error
