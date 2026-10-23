@@ -1,0 +1,62 @@
+name: Build BLHeli 4way for ESP32-S3-Zero
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Add ESP32-S3-Zero environment and USB CDC
+        shell: bash
+        run: |
+          cat >> platformio.ini <<'EOF'
+
+          [env:esp32s3_zero_4way]
+          extends = env:esp32_4way
+          board = esp32-s3-devkitm-1
+          board_upload.flash_size = 4MB
+          board_build.flash_mode = dio
+          build_flags =
+            -DARDUINO_USB_MODE=1
+            -DARDUINO_USB_CDC_ON_BOOT=1
+          EOF
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('src/esp32_4way/Global.cpp')
+          s = p.read_text()
+          old = 'const uint8_t ESC_PIN[NUM_ESC] = {16, 17, 18, 19};'
+          assert old in s, 'ESC pin declaration changed upstream; review patch'
+          s = s.replace(old, 'const uint8_t ESC_PIN[NUM_ESC] = {8, 9, 10, 11};')
+          old = 'uint8_t g_cur_pin = 16;'
+          assert old in s, 'Initial pin changed upstream; review patch'
+          s = s.replace(old, 'uint8_t g_cur_pin = 8;')
+          p.write_text(s)
+          PY
+
+      - name: Compile on GitHub runner
+        run: |
+          python -m pip install --disable-pip-version-check platformio 'esptool>=5,<6'
+          pio run -e esp32s3_zero_4way
+
+      - name: Create merged flash image at address 0x0
+        run: |
+          out='.pio/build/esp32s3_zero_4way'
+          python -m esptool --chip esp32s3 merge-bin \
+            --flash-mode dio --flash-size 4MB \
+            -o blheli4way-s3zero-merged.bin \
+            0x0 "$out/bootloader.bin" \
+            0x8000 "$out/partitions.bin" \
+            0x10000 "$out/firmware.bin"
+
+      - name: Upload result
+        uses: actions/upload-artifact@v4
+        with:
+          name: blheli4way-esp32s3-zero
+          path: blheli4way-s3zero-merged.bin
+          if-no-files-found: error
