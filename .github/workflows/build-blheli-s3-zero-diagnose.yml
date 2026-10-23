@@ -1,0 +1,138 @@
+name: Diagnose BLHeli bridge ESP32-S3-Zero
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Add minimal boot test and S3 build environments
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p src/s3_smoke
+          cat > src/s3_smoke/main.cpp <<'CPP'
+          #include <Arduino.h>
+          #include <HardwareSerial.h>
+
+          HardwareSerial debugUART(0);
+          void setup() {
+            debugUART.begin(115200, SERIAL_8N1, 44, 43);
+            Serial.begin(115200);  // ESP32-S3 native USB-Serial/JTAG
+            delay(250);
+            debugUART.println("S3 SMOKE TEST: setup OK");
+            Serial.println("S3 SMOKE TEST: setup OK");
+          }
+          void loop() {
+            static uint32_t counter = 0;
+            debugUART.printf("S3 SMOKE TEST: alive %lu\n", (unsigned long)counter);
+            Serial.printf("S3 SMOKE TEST: alive %lu\n", (unsigned long)counter);
+            counter++;
+            delay(1000);
+          }
+          CPP
+
+          cat >> platformio.ini <<'INI'
+
+          [env:s3_smoke]
+          extends = env:esp32_4way
+          board = esp32-s3-devkitm-1
+          board_upload.flash_size = 4MB
+          board_build.flash_mode = dio
+          board_build.f_flash = 40000000L
+          board_build.partitions = default.csv
+          build_src_filter = -<*> +<s3_smoke/>
+          build_flags =
+            -DARDUINO_USB_MODE=1
+            -DARDUINO_USB_CDC_ON_BOOT=1
+
+          [env:s3_4way]
+          extends = env:s3_smoke
+          build_src_filter = -<*> +<esp32_4way/>
+
+          [env:s3_4way_diag]
+          extends = env:s3_4way
+          build_flags =
+            ${env:s3_4way.build_flags}
+            -DESC4WAY_DIAG_MODE=1
+          INI
+
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('src/esp32_4way/Global.cpp')
+          s = p.read_text()
+          for old, new in [
+              ('const uint8_t ESC_PIN[NUM_ESC] = {16, 17, 18, 19};',
+               'const uint8_t ESC_PIN[NUM_ESC] = {8, 9, 10, 11};'),
+              ('uint8_t g_cur_pin = 16;', 'uint8_t g_cur_pin = 8;'),
+          ]:
+              if old not in s:
+                  raise SystemExit('Unexpected upstream source; check Global.cpp: ' + old)
+              s = s.replace(old, new)
+          p.write_text(s)
+          PY
+
+      - name: Build in GitHub cloud (nothing installed on local Ubuntu)
+        run: |
+          python -m pip install --disable-pip-version-check 'platformio>=6,<7' 'esptool>=5,<6'
+          pio run -e s3_smoke -e s3_4way -e s3_4way_diag
+
+      - name: Check binaries and create flash-at-0x0 images
+        shell: bash
+        run: |
+          set -euo pipefail
+          boot_app0="$HOME/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin"
+          test -s "$boot_app0"
+          mkdir -p dist
+          for env in s3_smoke s3_4way s3_4way_diag; do
+            out=".pio/build/$env"
+            for name in bootloader.bin partitions.bin firmware.bin firmware.elf; do
+              test -s "$out/$name"
+            done
+            python -m esptool --chip esp32s3 merge-bin \
+              --flash-mode dio --flash-freq 40m --flash-size 4MB \
+              -o "dist/$env-merged.bin" \
+              0x0 "$out/bootloader.bin" \
+              0x8000 "$out/partitions.bin" \
+              0xe000 "$boot_app0" \
+              0x10000 "$out/firmware.bin"
+            cp "$out/firmware.elf" "dist/$env-firmware.elf"
+            python - "dist/$env-merged.bin" <<'PY'
+          import sys
+          from pathlib import Path
+          f = Path(sys.argv[1])
+          blob = f.read_bytes()
+          print('\nIMAGE:', f, 'size:', len(blob))
+          for offset, label in ((0, 'bootloader'), (0x8000, 'partition table'), (0xe000, 'boot_app0'), (0x10000, 'app')):
+              head = blob[offset:offset+16]
+              print(f'  {label:16s} @0x{offset:05x}: {head.hex(" ")}')
+          assert blob[0] == 0xe9, 'Invalid ESP bootloader image header'
+          assert blob[0x8000:0x8002] == b'\xaa\x50', 'Invalid partition table header'
+          assert blob[0x10000] == 0xe9, 'Invalid ESP application image header'
+          assert len(blob) <= 4 * 1024 * 1024, 'Image larger than physical flash'
+          PY
+          done
+
+      - name: Symbolicate saved PC if possible
+        shell: bash
+        run: |
+          find "$HOME/.platformio/packages" -name '*addr2line' -type f | head -15
+          tool="$(find "$HOME/.platformio/packages" -name 'xtensa-esp32s3-elf-addr2line' -type f | head -1)"
+          if [ -n "$tool" ]; then
+            for elf in dist/*-firmware.elf; do
+              echo "Symbolication for $elf at 0x403cd9aa"
+              "$tool" -e "$elf" -f -C 0x403cd9aa || true
+            done
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: esp32s3-zero-diagnostics
+          path: dist/*
+          if-no-files-found: error
