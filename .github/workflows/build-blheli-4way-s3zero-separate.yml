@@ -1,0 +1,113 @@
+name: ESP32-S3-Zero BLHeli 4way - separate BIN files
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout SROT ESC flasher fork
+        uses: actions/checkout@v4
+
+      - name: Prepare ESP32-S3-Zero build (4 MB flash, USB Serial/JTAG)
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f platformio.ini
+          test -f src/esp32_4way/Global.cpp
+          cat >> platformio.ini <<'INI'
+
+          ; ESP32-S3-Zero (ESP32-S3FH4R2) - not the standard ESP32 DevKit
+          [env:s3_zero_base]
+          platform = espressif32@6.13.0
+          board = esp32-s3-devkitm-1
+          framework = arduino
+          monitor_speed = 115200
+          board_upload.flash_size = 4MB
+          board_build.flash_mode = qio
+          board_build.f_flash = 80000000L
+          board_build.arduino.memory_type = qio_qspi
+          board_build.partitions = default.csv
+          build_src_filter = -<*> +<esp32_4way/>
+          build_flags =
+            -DARDUINO_USB_MODE=1
+            -DARDUINO_USB_CDC_ON_BOOT=1
+
+          [env:s3_zero_4way]
+          extends = env:s3_zero_base
+
+          [env:s3_zero_diag]
+          extends = env:s3_zero_base
+          build_flags =
+            ${env:s3_zero_base.build_flags}
+            -DESC4WAY_DIAG_MODE=1
+          INI
+
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('src/esp32_4way/Global.cpp')
+          s = p.read_text()
+          changes = {
+              'const uint8_t ESC_PIN[NUM_ESC] = {16, 17, 18, 19};':
+              'const uint8_t ESC_PIN[NUM_ESC] = {8, 9, 10, 11};',
+              'uint8_t g_cur_pin = 16;': 'uint8_t g_cur_pin = 8;',
+          }
+          for old, new in changes.items():
+              if old not in s:
+                  raise SystemExit('Unexpected source layout: ' + old)
+              s = s.replace(old, new)
+          p.write_text(s)
+          print('S3 4-way GPIO: ESC1=8, ESC2=9, ESC3=10, ESC4=11')
+          PY
+
+      - name: Build on GitHub runner (not on your Ubuntu)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check 'platformio>=6,<7'
+          pio run -e s3_zero_diag -e s3_zero_4way
+
+      - name: Export separate images and validate headers
+        shell: bash
+        run: |
+          set -euo pipefail
+          boot_app0="$HOME/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin"
+          test -s "$boot_app0"
+          for fw in diag normal; do
+            if [ "$fw" = diag ]; then env=s3_zero_diag; else env=s3_zero_4way; fi
+            in_dir=".pio/build/$env"
+            out_dir="dist/$fw"
+            mkdir -p "$out_dir"
+            cp "$in_dir/bootloader.bin" "$out_dir/bootloader.bin"
+            cp "$in_dir/partitions.bin" "$out_dir/partitions.bin"
+            cp "$in_dir/firmware.bin" "$out_dir/firmware.bin"
+            cp "$boot_app0" "$out_dir/boot_app0.bin"
+            cp "$in_dir/firmware.elf" "$out_dir/firmware.elf"
+            python - "$out_dir" <<'PY'
+          from pathlib import Path
+          import sys
+          d = Path(sys.argv[1])
+          for name in ('bootloader.bin', 'partitions.bin', 'boot_app0.bin', 'firmware.bin'):
+              p = d / name
+              assert p.is_file() and p.stat().st_size > 0, f'Empty {p}'
+              print(f'{p}: {p.stat().st_size} bytes')
+          assert (d/'bootloader.bin').read_bytes()[0] == 0xe9, 'Bad bootloader magic'
+          assert (d/'firmware.bin').read_bytes()[0] == 0xe9, 'Bad firmware magic'
+          assert (d/'partitions.bin').read_bytes()[:2] == b'\xaa\x50', 'Bad partition table magic'
+          assert (d/'firmware.bin').stat().st_size < 0x150000, 'Firmware may exceed default partition'
+          PY
+          done
+          cmp dist/diag/bootloader.bin dist/normal/bootloader.bin
+          cmp dist/diag/partitions.bin dist/normal/partitions.bin
+          echo 'Bootloader and partition table identical for both builds.'
+
+      - name: Upload firmware files
+        uses: actions/upload-artifact@v4
+        with:
+          name: blheli-4way-esp32s3-zero-separate
+          path: dist/
+          if-no-files-found: error
