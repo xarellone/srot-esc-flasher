@@ -1,0 +1,280 @@
+name: Build ESP32-S3-Zero PWM Reader
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Prepare self-contained ESP-IDF project
+        shell: bash
+        run: |
+          mkdir -p _pwm_reader/.
+          cat > _pwm_reader/CMakeLists.txt <<'PWM_READER_FILE_END'
+          cmake_minimum_required(VERSION 3.16)
+          include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+          project(esp32s3_pwm_reader)
+          PWM_READER_FILE_END
+          mkdir -p _pwm_reader/main
+          cat > _pwm_reader/main/CMakeLists.txt <<'PWM_READER_FILE_END'
+          idf_component_register(SRCS "pwm_reader.c" INCLUDE_DIRS "."
+              REQUIRES esp_driver_gpio esp_driver_uart esp_timer)
+          PWM_READER_FILE_END
+          mkdir -p _pwm_reader/main
+          cat > _pwm_reader/main/pwm_logic.h <<'PWM_READER_FILE_END'
+          #pragma once
+
+          #include <stdint.h>
+          #include <stdbool.h>
+
+          /* Platform-independent edge accounting. Timing source: monotonic microseconds. */
+          typedef struct {
+              int64_t last_rise_us;
+              int64_t last_complete_us;
+              uint32_t period_us;
+              uint32_t high_us;
+              uint32_t pulses;
+              bool last_level;
+              bool got_period;
+              bool got_width;
+          } pwm_capture_t;
+
+          static inline void pwm_capture_edge(pwm_capture_t *s, bool level, int64_t now_us)
+          {
+              if (level == s->last_level) {
+                  return; /* Duplicate notification / same-state read. */
+              }
+              s->last_level = level;
+
+              if (level) { /* Rising edge. */
+                  if (s->last_rise_us > 0 && now_us > s->last_rise_us) {
+                      int64_t elapsed = now_us - s->last_rise_us;
+                      if (elapsed >= 100 && elapsed <= 2000000) {
+                          s->period_us = (uint32_t)elapsed;
+                          s->got_period = true;
+                      } else {
+                          s->got_period = false;
+                      }
+                  }
+                  s->last_rise_us = now_us;
+              } else if (s->last_rise_us > 0 && now_us > s->last_rise_us) { /* Falling edge. */
+                  int64_t high = now_us - s->last_rise_us;
+                  if (high >= 10 && high <= 100000) {
+                      s->high_us = (uint32_t)high;
+                      s->last_complete_us = now_us;
+                      s->got_width = true;
+                      s->pulses++;
+                  } else {
+                      s->got_width = false;
+                  }
+              }
+          }
+          PWM_READER_FILE_END
+          mkdir -p _pwm_reader/main
+          cat > _pwm_reader/main/pwm_reader.c <<'PWM_READER_FILE_END'
+          #include <stdio.h>
+          #include <string.h>
+          #include <stdarg.h>
+          #include <inttypes.h>
+          #include <stdint.h>
+
+          #include "freertos/FreeRTOS.h"
+          #include "freertos/task.h"
+          #include "freertos/portmacro.h"
+          #include "driver/gpio.h"
+          #include "driver/uart.h"
+          #include "esp_timer.h"
+          #include "esp_err.h"
+
+          #include "pwm_logic.h"
+
+          /* WAVESHARE ESP32-S3-ZERO: four independent PWM inputs, 3.3V logic ONLY. */
+          #define N_CHANNELS 4
+          static const gpio_num_t k_pins[N_CHANNELS] = {GPIO_NUM_4, GPIO_NUM_5, GPIO_NUM_6, GPIO_NUM_7};
+          static pwm_capture_t s_channels[N_CHANNELS];
+          static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
+          static bool s_uart0_ready = false;
+
+          /* GPIO callbacks run from the interrupt service; print only from the main task. */
+          static void on_gpio_edge(void *context)
+          {
+              const unsigned idx = (unsigned)(uintptr_t)context;
+              const int64_t now_us = esp_timer_get_time();
+              const bool level = gpio_get_level(k_pins[idx]) != 0;
+              portENTER_CRITICAL_ISR(&s_lock);
+              pwm_capture_edge(&s_channels[idx], level, now_us);
+              portEXIT_CRITICAL_ISR(&s_lock);
+          }
+
+          /* Mirror lines to native USB Serial/JTAG (/dev/ttyACM*) and UART0 TX GPIO43. */
+          static void print_both(const char *fmt, ...)
+          {
+              char line[180];
+              va_list ap;
+              va_start(ap, fmt);
+              vsnprintf(line, sizeof(line), fmt, ap);
+              va_end(ap);
+              fputs(line, stdout);
+              fflush(stdout);
+              if (s_uart0_ready) {
+                  uart_write_bytes(UART_NUM_0, line, strlen(line));
+              }
+          }
+
+          static void configure_uart0(void)
+          {
+              uart_config_t cfg = {
+                  .baud_rate = 115200,
+                  .data_bits = UART_DATA_8_BITS,
+                  .parity = UART_PARITY_DISABLE,
+                  .stop_bits = UART_STOP_BITS_1,
+                  .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+                  .source_clk = UART_SCLK_DEFAULT,
+              };
+
+              if (uart_param_config(UART_NUM_0, &cfg) == ESP_OK &&
+                  uart_set_pin(UART_NUM_0, GPIO_NUM_43, GPIO_NUM_44,
+                               UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE) == ESP_OK &&
+                  uart_driver_install(UART_NUM_0, 256, 256, 0, NULL, 0) == ESP_OK) {
+                  s_uart0_ready = true;
+              }
+          }
+
+          void app_main(void)
+          {
+              configure_uart0();
+
+              gpio_config_t config = {
+                  .pin_bit_mask = (1ULL << 4) | (1ULL << 5) | (1ULL << 6) | (1ULL << 7),
+                  .mode = GPIO_MODE_INPUT,
+                  .pull_up_en = GPIO_PULLUP_DISABLE,
+                  .pull_down_en = GPIO_PULLDOWN_ENABLE,
+                  .intr_type = GPIO_INTR_ANYEDGE,
+              };
+              ESP_ERROR_CHECK(gpio_config(&config));
+              ESP_ERROR_CHECK(gpio_install_isr_service(0));
+
+              for (unsigned i = 0; i < N_CHANNELS; i++) {
+                  /* Record initial level to avoid a false first edge. */
+                  s_channels[i].last_level = gpio_get_level(k_pins[i]) != 0;
+                  ESP_ERROR_CHECK(gpio_isr_handler_add(k_pins[i], on_gpio_edge, (void *)(uintptr_t)i));
+              }
+
+              vTaskDelay(pdMS_TO_TICKS(500));
+              print_both("\r\nESP32-S3-Zero PWM reader ready. 4 inputs, 3.3V only.\r\n");
+              print_both("USB /dev/ttyACM* or UART0 TX GPIO43, 115200 baud.\r\n");
+              print_both("Connect GND common; CH1=GPIO4 CH2=GPIO5 CH3=GPIO6 CH4=GPIO7\r\n");
+              print_both("Supports regular PWM / servo PWM, NOT DShot.\r\n\r\n");
+
+              while (true) {
+                  pwm_capture_t capture[N_CHANNELS];
+                  const int64_t now_us = esp_timer_get_time();
+                  portENTER_CRITICAL(&s_lock);
+                  for (unsigned i = 0; i < N_CHANNELS; i++) {
+                      capture[i] = s_channels[i];
+                  }
+                  portEXIT_CRITICAL(&s_lock);
+
+                  for (unsigned i = 0; i < N_CHANNELS; i++) {
+                      const pwm_capture_t *s = &capture[i];
+                      if (!s->last_complete_us || now_us - s->last_complete_us > 1000000) {
+                          print_both("CH%u GPIO%d: NO SIGNAL\r\n", i + 1, (int)k_pins[i]);
+                      } else if (!s->got_period || !s->got_width || !s->period_us) {
+                          print_both("CH%u GPIO%d: ACQUIRING...\r\n", i + 1, (int)k_pins[i]);
+                      } else {
+                          const double hz = 1000000.0 / (double)s->period_us;
+                          const double duty = (100.0 * s->high_us) / (double)s->period_us;
+                          print_both("CH%u GPIO%d: HIGH=%" PRIu32 " us  PERIOD=%" PRIu32
+                                     " us  FREQ=%.2f Hz  DUTY=%.2f%%\r\n",
+                                     i + 1, (int)k_pins[i], s->high_us, s->period_us, hz, duty);
+                      }
+                  }
+                  print_both("----\r\n");
+                  vTaskDelay(pdMS_TO_TICKS(500));
+              }
+          }
+          PWM_READER_FILE_END
+          mkdir -p _pwm_reader/.
+          cat > _pwm_reader/sdkconfig.defaults <<'PWM_READER_FILE_END'
+          CONFIG_IDF_TARGET="esp32s3"
+          CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+          CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
+          CONFIG_ESPTOOLPY_FLASHFREQ_40M=y
+          CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+          CONFIG_PARTITION_TABLE_SINGLE_APP=y
+          CONFIG_SPIRAM=n
+          CONFIG_LOG_DEFAULT_LEVEL_WARN=y
+          PWM_READER_FILE_END
+          mkdir -p _pwm_reader/.
+          cat > _pwm_reader/build_fw.sh <<'PWM_READER_FILE_END'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          idf.py build
+          esptool.py --chip esp32s3 merge_bin \
+            -o build/esp32s3_pwm_reader_merged.bin \
+            --flash_mode dio --flash_freq 40m --flash_size 4MB \
+            0x0 build/bootloader/bootloader.bin \
+            0x8000 build/partition_table/partition-table.bin \
+            0x10000 build/esp32s3_pwm_reader.bin
+          ls -lh build/esp32s3_pwm_reader_merged.bin
+          PWM_READER_FILE_END
+          mkdir -p _pwm_reader/tests
+          cat > _pwm_reader/tests/test_pwm_logic.c <<'PWM_READER_FILE_END'
+          #include <assert.h>
+          #include <stdio.h>
+          #include "../main/pwm_logic.h"
+
+          int main(void)
+          {
+              pwm_capture_t c = {0};
+              pwm_capture_edge(&c, true, 1000);
+              pwm_capture_edge(&c, false, 2500); /* 1500 us high */
+              pwm_capture_edge(&c, true, 21000); /* 20000 us period */
+              pwm_capture_edge(&c, false, 22500);
+              assert(c.high_us == 1500 && c.period_us == 20000);
+              assert(c.got_width && c.got_period && c.pulses == 2);
+              pwm_capture_edge(&c, true, 23500); /* 2500 us period */
+              pwm_capture_edge(&c, false, 25000);
+              assert(c.period_us == 2500 && c.high_us == 1500);
+              pwm_capture_edge(&c, false, 26000); /* duplicate ignored */
+              assert(c.pulses == 3);
+              printf("PWM logic unit tests OK (50 Hz, 400 Hz, 1500 us)\n");
+              return 0;
+          }
+          PWM_READER_FILE_END
+
+      - name: Test pulse measurement logic (host GCC)
+        shell: bash
+        run: |
+          set -e
+          gcc -std=c11 -Wall -Wextra -Werror _pwm_reader/tests/test_pwm_logic.c -o /tmp/pwm_logic_test
+          /tmp/pwm_logic_test
+
+      - name: Build ESP32-S3 firmware with official ESP-IDF
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.4.2
+          target: esp32s3
+          path: _pwm_reader
+          command: bash build_fw.sh
+
+      - name: Publish flashable merged BIN and ELF
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp32s3-zero-pwm-reader
+          path: |
+            _pwm_reader/build/esp32s3_pwm_reader_merged.bin
+            _pwm_reader/build/esp32s3_pwm_reader.bin
+            _pwm_reader/build/esp32s3_pwm_reader.elf
+            _pwm_reader/build/bootloader/bootloader.bin
+            _pwm_reader/build/partition_table/partition-table.bin
+            _pwm_reader/build/flash_args
+          if-no-files-found: error
+          retention-days: 30
